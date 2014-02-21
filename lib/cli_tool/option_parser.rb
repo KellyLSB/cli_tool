@@ -6,15 +6,19 @@ module CliTool
     # Use to add the methods below to any class
     def self.included(base)
       base.extend(ClassMethods)
+      base.options({
+        dependency: :none,
+        short: :h
+      })
     end
 
     module ClassMethods
 
       # Map for symbol types
       GOL_MAP = {
-        :none     => GetoptLong::NO_ARGUMENT,
-        :optional => GetoptLong::OPTIONAL_ARGUMENT,
-        :required => GetoptLong::REQUIRED_ARGUMENT
+        none: GetoptLong::NO_ARGUMENT,
+        optional: GetoptLong::OPTIONAL_ARGUMENT,
+        required: GetoptLong::REQUIRED_ARGUMENT
       }
 
       # Create the options array
@@ -24,6 +28,8 @@ module CliTool
         # If no options were passed then return
         return @@options.uniq unless opts
 
+        _create_preprocess(opts)
+        _create_help_(opts)
         _create_attrs_(opts)
         default_options(opts)
         @@options = @@options.concat(_create_gola_(opts)).uniq
@@ -53,11 +59,11 @@ module CliTool
       end
 
       # Handle running options
-      def run(entrypoint = false, *args)
+      def run(entrypoint = false, *args, &block)
         if args.last.instance_of?(self)
-          instance = args.pop
+          obj = args.pop
         else
-          instance = new
+          obj = self < Singleton ? instance : new
         end
 
         # Option Setter Proc
@@ -73,8 +79,21 @@ module CliTool
             value
           end
 
-          puts "Setting @#{optionify(option)} = #{value}"
-          instance.__send__(optionify(option, :set), value)
+          # Run any preprocessors on the data before assignment
+          preprocessor =  @@preprocessors[optionify(option)]
+          if preprocessor
+            value = obj.__send__(:instance_exec, value, &preprocessor)
+          end
+
+          # Show notice of the setting being accepted
+          if @@__secure_options.include?(optionify(option))
+            puts "Securely Setting @#{optionify(option)} = #{'*' * value.length}"
+          else
+            peuts "Setting @#{optionify(option)} = #{value}"
+          end
+
+          # Do the actual set for us
+          obj.__send__(optionify(option, :set), value)
         end
 
         # Set options
@@ -83,18 +102,76 @@ module CliTool
         GetoptLong.new(*options).each(&option_setter)
         puts ''
 
+        if obj.help
+          puts help
+          exit
+        end
+
         # Handle the entrypoint
         if entrypoint
           entrypoint = optionify(entrypoint)
-          instance.__send__(entrypoint, *args)
+          obj.__send__(entrypoint, *args, &block)
         else
-          instance
+          obj
+        end
+      end
+
+      def help(message = nil)
+        if message.nil?
+          help_text = @@help_options.map do |option|
+            case options[:dependency]
+            when :required
+              long_dep = "=<#{options[:default] || 'value'}>"
+              short_dep = " <#{options[:default] || 'value'}>"
+            when :optional
+              long_dep = "=[#{options[:default] || 'value'}]"
+              short_dep = " [#{options[:default] || 'value'}]"
+            when :none
+              long_dep = ''
+              short_dep = ''
+            end
+
+            message = options[:keys].map{ |x| "--#{x}#{long_dep}"}.join(', ')
+            message << ", -#{options[:short]}#{short_dep}" if option[:short]
+            message << %{ :: Default: "#{options[:default]}"} if options[:default]
+            message << %{\n\t#{options[:documentation]}} if options[:documentation]
+            message << "\n"
+          end
+
+          <<-HELP
+          #{$0}
+
+          #{help_text.join("\n")}
+
+          #{@@help_message || "No additional documentation"}
+          HELP
+        else
+          @@help_message = message
         end
       end
 
       private
 
+      def _create_preprocess_(opts)
+        @@preprocessors = opts.reduce({}) do |out, (keys, other)|
+          keys.reduce(out) do |o, key|
+            o.merge(key => other[:preprocess])
+          end
+        end
+      end
+
+      def _create_help_(opts)
+        @@help_options = opts.reduce([]) do |out, (keys, other)|
+          out << other.merge(keys: [keys].flatten.compact)
+        end
+      end
+
       def _create_attrs_(opts)
+
+        # Create secure options (don't shwow assignment in terminal)
+        @@__secure_options = opts.reduce([]) do |out, (keys, other)|
+          other[:secure] == true ? (out << keys).flatten.compact.uniq : out
+        end
 
         # Get the option keys for attr creation
         keys = opts.keys

@@ -3,128 +3,298 @@ module CliTool
     class WaitingForSSH < StandardError; end;
     class Failure < StandardError; end;
 
-    class Script < String
-      def <<(script)
-        script = script.strip + ';' unless script.match(/;$/)
-        script = Script.new(script)
-        super("#{script}\n")
+    class Script
+      include CliTool::StdinOut
+      attr_accessor :commands
+      attr_accessor :environment
+
+      def initialize
+        @environment = {}
+        @commands    = []
+        @apt         = {}
+        @remote_installed = 0
+      end
+      alias reset initialize
+
+      ################
+      #= User Tools =#
+      ################
+
+      # def adduser(user, system = false)
+      #   script "adduser --disabled-password --quiet --gecos '' #{user}".squeeze(' '), :sudo
+      # end
+
+      ###############
+      #= Apt Tools =#
+      ###############
+
+      def install(*packages); apt(:install, *packages) end
+
+      def purge(*packages);   apt(:purge, *packages)   end
+
+      def remove(*packages);  apt(:remove, *packages)  end
+
+      def update;             apt(:update)             end
+
+      def upgrade;            apt(:upgrade)            end
+
+      def upgrade!;           apt(:'dist-upgrade')     end
+
+      def aptkey(*keys)
+        keyserver = yield if block_given?
+        keyserver ||= 'keyserver.ubuntu.com'
+        exec("apt-key adv --keyserver #{keyserver} --recv-keys #{keys.join(' ')}", :sudo)
+        self
       end
 
-      def prepend(script)
-        script = script.strip + ';' unless script.match(/;$/)
-        script = Script.new(script)
-        super("#{script}\n")
+      ##########
+      #= DPKG =#
+      ##########
+
+      def if_installed?(*packages);     check_installed(true, *packages)  end
+
+      def unless_installed?(*packages); check_installed(false, *packages) end
+
+      def dpkg_install(*packages)
+        packages.each do |package|
+          exec("dpkg -i #{package}", :sudo)
+        end
+        self
+      end
+
+      def remote_install(*packages)
+        @remote_installed = 0
+        packages.each do
+          @remote_installed += 1
+          tmp = "#{Time.now.to_s}#{@remote_installed}.deb"
+          curl(file, tmp, :sudo)
+          dpkg_install(tmp)
+          exec("rm -f #{tmp}", :sudo)
+        end
+        self
+      end
+
+      ###########
+      #= Tools =#
+      ###########
+
+      def wget(from, to, sudo = false, sudouser = :root)
+        install(:wget)
+        exec("wget -O #{to} #{from}", sudo, sudouser)
+        self
+      end
+
+      def curl(from, to, sudo = false, sudouser = :root)
+        install(:curl)
+        exec("curl -# -o #{to} #{from}", sudo, sudouser)
+        self
+      end
+
+      def service(name, action)
+        exec("service #{name} #{action}", :sudo)
+      end
+
+      ##########
+      #= Exec =#
+      ##########
+
+      def exec(script, sudo = false, sudouser = :root)
+        if File.exist?(script)
+          script = File.read(script)
+        end
+        # Wrap the script in a sudoers block
+        script  = %{sudo su -l -c "/bin/bash" #{sudouser || :root} <<-EOF\n#{script.rstrip}\nEOF} if sudo || sudo == :sudo
+        @commands << script.rstrip
+        self
+      end
+
+      def to_s(indent = 0)
+        script = @environment.reduce([]).each do |out, (key, val)|
+          out << %{#{(' ' * indent)}#{key.upcase}="#{val}"}
+        end
+
+        @commands.split(/\n/).reduce(script){ |out, x|  out << ((' ' * indent) + x) }.join("\n")
+      end
+
+      private
+
+      def apt(command, *p, &b)
+        @environment['DEBIAN_FRONTEND'] = 'noninteractive'
+        return aptkey(*p, &b) if command == :key
+        return if ((@apt[command] ||= []) - p).empty? && [:install, :purge, :remove].include?(command)
+        ((@apt[command] ||= []) << p).flatten!
+        exec(('apt-get #{command} -q -y --force-yes ' + p.map(&:to_s).join(' ')), :sudo)
+        self
+      end
+
+      def check_installed(installed, *p)
+        installed = installed ? '1' : '0'
+
+        exec('if ' << packages.reduce([]) { |command, package|
+          command << %{[ "$(dpkg -s #{package} > /dev/null 2>1 && echo '1' || echo '0')" == '#{installed}' ]}
+        }.join(' && ') << "; then\n" << Script.new.__send__(:instance_exec, &block).to_s(2) << "\nfi")
+        self
       end
     end
 
     def self.included(base)
+      base.__send__(:include, ::Singleton)
+      base.__send__(:alias_method, :new, :instance)
       base.__send__(:include, ::CliTool::StdinOut)
       base.__send__(:include, ::CliTool::OptionParser)
       base.__send__(:include, ::CliTool::SoftwareDependencies)
       base.extend(ClassMethods)
       base.software(:ssh, :nc)
-      base.options host: :required,
-        identity: :required,
-        debug: :none,
-        user: {
+      base.options({
+        [:username, :user] => {
+          default: %x{whoami}.strip,
           dependency: :required,
-          default: %x{whoami}.strip
+          short: :u,
+          documentation: 'SSH username'
+        },
+        [:password, :pass] => {
+          default: '22',
+          dependency: :required,
+          short: :p,
+          documentation: 'SSH password (not implemented)'
+        },
+        identity: {
+          dependency: :required,
+          short: :i,
+          documentation: 'SSH key to use'
+        },
+        host: {
+          dependency: :required,
+          short: :h,
+          documentation: 'SSH host to connect to'
         },
         port: {
+          default: '22',
           dependency: :required,
-          default: '22'
-        }
+          short: :p,
+          documentation: 'SSH port to connect on'
+        },
+        [:tags, :tag] => {
+          dependency: :required,
+          short: :t,
+          documentation: 'Run tags (limit scripts to run)',
+          preprocess: ->(tags) { tags.split(',').map{ |x| x.strip.to_sym } }
+        },
+        debug: :none
+      })
     end
 
-    def script(script = nil, sudo = false, sudouser = nil)
-      @_script ||= Script.new
-      return Script.new(@_script.strip) if script.nil?
-      return @_script = Script.new if script == :reset
-      @_script << (sudo == :sudo ? %{sudo su -l -c "#{script.strip.gsub('"','\"')}" #{sudouser}} : script).strip
-    end
+    # NEED SINGLETON OBJECT!!!
 
-    def script_exec
-      wait4ssh
+    class << self
+      def script(options = {}, &block)
+        script = Proc.new do |obj|
+          run = true
 
-      command =[ "ssh -t -t" ]
-      command << "-I #{@identity}" if @identity
-      command << "-p #{@port}" if @port
-      command << "#{@user}@#{@host}"
-      command << "<<-SCRIPT\n#{script}\nexit;\nSCRIPT"
-      command  = command.join(' ')
-      script :reset
+          if obj[:tags]
+            tags = (options[:tags] || []).concat([options[:tag]]).compact.flatten
+            run = false if (kls.tags.map{ |x| "#{x}".strip.to_sym } & tags).empty?
+          end
 
-      puts("Running Remotely:\n#{command}\n", [:blue, :white_bg])
+          if run # Do we want to run this script?
+            build_script = Script.new
+            build_script.__send__(:instance_exec, obj, &block)
+            if options[:reboot] == true
+              build_script.exec('shutdown -r now', :sudo)
+              puts "Waiting for server reboot!"
+              sleep 5
+            elsif options[:shutdown] == true
+              build_script.exec('shutdown -h now', :sudo)
+              puts "Server shutdown requested!"
+            end
 
-      system(command)
+            build_script
+          else
+            false # Don't run anything
+          end
+        end
 
-      unless $?.success?
-        raise Failure, "Error running \"#{command}\" on #{@host} exited with code #{$?.to_i}."
+        queue(script)
+      end
+
+      def shutdown!
+        queue(Script.new.exec('shutdown -h now', :sudo))
+      end
+
+      def restart!
+        queue(Script.new.exec('shutdown -r now', :sudo))
+      end
+
+      def   !(*a, &b)
+        run(:run_suite!, *a, &b)
+      end
+
+      def custom!(*a, &b)
+        Proc.new { |obj| obj.instance_exec(*a, &b) }
+        false
+      end
+
+      private
+
+      def queue(*items)
+        return @@queue || [] if items.empty?
+        items.map!{ |x| x.is_a?(Script) ? x.to_s : x }.flatten!
+        ((@@queue ||= []) << x).flatten!
+        self
       end
     end
 
-    def aptget(action = :update, *software)
-      software = software.map(&:to_s).join(' ')
-      script "apt-get #{action} -q -y --force-yes #{software}", :sudo
+    def export(dir = nil)
+      self.class.queue.select{ |x| x.is_a?(String) }
     end
 
-    def aptkeyadd(*keys)
-      keys = keys.map(&:to_s).join(' ')
-      script "apt-key adv --keyserver keyserver.ubuntu.com --recv-keys #{keys}", :sudo
-    end
+    def remote_exec!(script)
+      ssh_cmd =[ 'ssh -t -t' ]
+      ssh_cmd << "-I #{@identity}" if @identity
+      ssh_cmd << "-p #{@port}"     if @port
+      ssh_cmd << "#{@user}@#{@host}"
+      ssh_cmd << "<<-SCRIPT\n#{script}\nexit;\nSCRIPT"
 
-    def restart
-      script :reset
-      script "shutdown -r now &", :sudo
-      script_exec
-
-      # Let the server shutdown
-      sleep 5
-    end
-
-    def adduser(user, system = false)
-      script "adduser --disabled-password --quiet --gecos '' #{user}".squeeze(' '), :sudo
-    end
-
-    def wait4ssh
-      _retry ||= false
-      %x{nc -z #{@host} #{@port}}
-      raise WaitingForSSH unless $?.success?
-      puts("\nSSH is now available!", :green) if _retry
-    rescue WaitingForSSH
-      print "Waiting for ssh..." unless _retry
-      _retry = true
-      print '.'
-      sleep 2
-      retry
-    end
-
-    module ClassMethods
-
-      # Create the options array
-      def software(*soft)
-        @@software ||= []
-
-        # If no software dependencies were passed then return
-        return @@software.uniq unless soft
-
-        # Find missing software
-        missing = []
-        soft.each do |app|
-          %x{which #{app}}
-          missing << app unless $?.success?
-        end
-
-        # Raise if there were any missing software's
-        unless missing.empty?
-          missing = missing.join(', ')
-          raise CliTool::MissingDependencies,
-            %{The required software packages "#{missing}" could not be found in your $PATH.}
-        end
-
-        # Append to the software list
-        @@software = @@software.concat(soft).uniq
+      if @debug
+        message = "About to run remote process over ssh on #{@user}@#{@host}:#{@port}"
+        puts message, :blue
+        puts '#' * message.length, :blue
+        puts script, :green
+        puts '#' * message.length, :blue
+        confirm "Should we continue?", :red
       end
+
+      return false unless ssh_connection?
+
+      system(ssh_cmd.join(' '))
+      $?.success?
+    end
+
+    def run_suite!
+      self.class.queue.each do |item|
+        item = instance_exec(&item) if item.is_a?(Proc)
+        remote_exec!(item) if item.is_a?(String)
+      end
+    end
+
+    private
+
+    def ssh_connection?
+      port_available = false
+      tries = 0
+
+      while ! port_available && tries < 6
+        %x{nc -z #{@host} #{@port}}
+        port_available = $?.success?
+        break if port_available
+        print 'Waiting for ssh...' if tries < 1
+        print '.'
+        tries += 1
+        sleep 4
+      end
+
+      puts ''
+      port_available
     end
   end
 end
