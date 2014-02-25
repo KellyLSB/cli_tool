@@ -1,3 +1,4 @@
+require 'io/console'
 require 'timeout'
 
 module CliTool
@@ -5,37 +6,37 @@ module CliTool
     class MissingInput < StandardError; end;
 
     ANSI_COLORS = {
-      :reset         => 0,
-      :bold          => 1,
-      :italic        => 3,
-      :underline     => 4,
-      :inverse       => 7,
-      :strike        => 9,
-      :bold_off      => 22,
-      :italic_off    => 23,
-      :underline_off => 24,
-      :inverse_off   => 27,
-      :strike_off    => 29,
-      :black         => 30,
-      :red           => 31,
-      :green         => 32,
-      :yellow        => 33,
-      :blue          => 34,
-      :magenta       => 35,
-      :purple        => 35,
-      :cyan          => 36,
-      :white         => 37,
-      :default       => 39,
-      :black_bg      => 40,
-      :red_bg        => 41,
-      :green_bg      => 42,
-      :yellow_bg     => 43,
-      :blue_bg       => 44,
-      :magenta_bg    => 45,
-      :purple_bg     => 45,
-      :cyan_bg       => 46,
-      :white_bg      => 47,
-      :default_bg    => 49
+      reset: 0,
+      bold: 1,
+      italic: 3,
+      underline: 4,
+      inverse: 7,
+      strike: 9,
+      bold_off: 22,
+      italic_off: 23,
+      underline_off: 24,
+      inverse_off: 27,
+      strike_off: 29,
+      black: 30,
+      red: 31,
+      green: 32,
+      yellow: 33,
+      blue: 34,
+      magenta: 35,
+      purple: 35,
+      cyan: 36,
+      white: 37,
+      default: 39,
+      black_bg: 40,
+      red_bg: 41,
+      green_bg: 42,
+      yellow_bg: 43,
+      blue_bg: 44,
+      magenta_bg: 45,
+      purple_bg: 45,
+      cyan_bg: 46,
+      white_bg: 47,
+      default_bg: 49
     }
 
     def self.included(base)
@@ -49,11 +50,23 @@ module CliTool
       def puts(text, color = :reset, timer = nil)
 
         # Process information for ANSI color codes
-        super(_colorize_(text, color))
+        super(colorize(text, color))
 
         # Sleep after displaying the message
         if timer
-          puts(_colorize_("Sleeping for #{timer} seconds...", color))
+          puts(colorize("Sleeping for #{timer} seconds...", color))
+          sleep(timer)
+        end
+      end
+
+      def print(text, color = :reset, timer = nil)
+
+        # Process information for ANSI color codes
+        super(colorize(text, color))
+
+        # Sleep after displaying the message
+        if timer
+          puts(colorize("Sleeping for #{timer} seconds...", color))
           sleep(timer)
         end
       end
@@ -61,11 +74,18 @@ module CliTool
       def input(message = '', color = :reset, timer = nil, default = nil)
 
         # Prompt for input
-        puts(message, color)
+        print("#{message} ", color)
 
         # Get the input from the CLI
-        gets = Proc.new do
-          STDIN.gets.strip
+        if block_given? && yield == :noecho
+          gets = Proc.new do
+            STDIN.noecho(&:gets).strip
+            print "\n"
+          end
+        else
+          gets = Proc.new do
+            STDIN.gets.strip
+          end
         end
 
         # Handle timing out
@@ -80,6 +100,10 @@ module CliTool
         end
 
         result
+      end
+
+      def password(*a)
+        input(*a) { :noecho }
       end
 
       def confirm(message, color = :reset, default = :n, timer = nil)
@@ -107,9 +131,7 @@ module CliTool
         result
       end
 
-      private
-
-      def _colorize_(text, *color)
+      def colorize(text, *color)
 
         # Determine what to colors we should use
         color = [:reset] if color.empty?

@@ -1,3 +1,6 @@
+require 'singleton'
+require 'pry'
+
 module CliTool
   module Remote
     class WaitingForSSH < StandardError; end;
@@ -7,12 +10,14 @@ module CliTool
       include CliTool::StdinOut
       attr_accessor :commands
       attr_accessor :environment
+      attr_accessor :indent
 
       def initialize
         @environment = {}
         @commands    = []
         @apt         = {}
         @remote_installed = 0
+        @indent      = 0
       end
       alias reset initialize
 
@@ -41,6 +46,7 @@ module CliTool
       def upgrade!;           apt(:'dist-upgrade')     end
 
       def aptkey(*keys)
+        @environment['DEBIAN_FRONTEND'] = %{noninteractive}
         keyserver = yield if block_given?
         keyserver ||= 'keyserver.ubuntu.com'
         exec("apt-key adv --keyserver #{keyserver} --recv-keys #{keys.join(' ')}", :sudo)
@@ -64,10 +70,11 @@ module CliTool
 
       def remote_install(*packages)
         @remote_installed = 0
-        packages.each do
+        packages.each do |package|
           @remote_installed += 1
-          tmp = "#{Time.now.to_s}#{@remote_installed}.deb"
-          curl(file, tmp, :sudo)
+          num = "#{@remote_installed}".rjust(3,'0')
+          tmp = "/tmp/package#{num}.deb"
+          curl(package, tmp, :sudo)
           dpkg_install(tmp)
           exec("rm -f #{tmp}", :sudo)
         end
@@ -94,6 +101,14 @@ module CliTool
         exec("service #{name} #{action}", :sudo)
       end
 
+      def file_exist?(file, exist = true, &block)
+        if?((exist ? '' : '! ') + %{-f "#{file}"}, &block)
+      end
+
+      def directory_exist(directory, exist = true, &block)
+        if?((exist ? '' : '! ') + %{-d "#{file}"}, &block)
+      end
+
       ##########
       #= Exec =#
       ##########
@@ -102,44 +117,58 @@ module CliTool
         if File.exist?(script)
           script = File.read(script)
         end
+
         # Wrap the script in a sudoers block
-        script  = %{sudo su -l -c "/bin/bash" #{sudouser || :root} <<-EOF\n#{script.rstrip}\nEOF} if sudo || sudo == :sudo
+        if sudo || sudo == :sudo
+          sudo_script  = %{sudo su -c "/bin/bash" #{sudouser || :root}}
+          sudo_script << %{ <<-EOF\n#{get_environment_exports}#{script.rstrip}\nEOF}
+          script = sudo_script
+        end
+
         @commands << script.rstrip
         self
       end
 
       def to_s(indent = 0)
-        script = @environment.reduce([]).each do |out, (key, val)|
-          out << %{#{(' ' * indent)}#{key.upcase}="#{val}"}
-        end
-
-        @commands.split(/\n/).reduce(script){ |out, x|  out << ((' ' * indent) + x) }.join("\n")
+        @commands.reduce([get_environment_exports(@indent)]){ |out, x|  out << ((' ' * @indent) + x) }.join("\n")
       end
 
       private
 
       def apt(command, *p, &b)
-        @environment['DEBIAN_FRONTEND'] = 'noninteractive'
+        @environment['DEBIAN_FRONTEND'] = %{noninteractive}
         return aptkey(*p, &b) if command == :key
-        return if ((@apt[command] ||= []) - p).empty? && [:install, :purge, :remove].include?(command)
-        ((@apt[command] ||= []) << p).flatten!
-        exec(('apt-get #{command} -q -y --force-yes ' + p.map(&:to_s).join(' ')), :sudo)
+        #return if ((@apt[command] ||= []) - p).empty? && [:install, :purge, :remove].include?(command)
+        #((@apt[command] ||= []) << p).flatten!
+        exec(("apt-get -o Dpkg::Options::='--force-confnew' -q -y --force-yes #{command} " + p.map(&:to_s).join(' ')), :sudo)
         self
       end
 
-      def check_installed(installed, *p)
+      def check_installed(installed, *p, &block)
         installed = installed ? '1' : '0'
 
-        exec('if ' << packages.reduce([]) { |command, package|
+        condition = packages.reduce([]) { |command, package|
           command << %{[ "$(dpkg -s #{package} > /dev/null 2>1 && echo '1' || echo '0')" == '#{installed}' ]}
-        }.join(' && ') << "; then\n" << Script.new.__send__(:instance_exec, &block).to_s(2) << "\nfi")
+        }.join(' && ')
+
+        if?(condition, &block)
         self
+      end
+
+      def if?(condition, &block)
+        exec(%{if [ #{condition} ]; then\n"} << Script.new.__send__(:instance_exec, &block).to_s(@indent + 2) << "\nfi")
+        self
+      end
+
+      def get_environment_exports(indent = 0)
+        @environment.reduce([]) { |out, (key, val)|
+          out << %{export #{(' ' * indent)}#{key.upcase}=#{val}}
+        }.join("\n") << "\n"
       end
     end
 
     def self.included(base)
       base.__send__(:include, ::Singleton)
-      base.__send__(:alias_method, :new, :instance)
       base.__send__(:include, ::CliTool::StdinOut)
       base.__send__(:include, ::CliTool::OptionParser)
       base.__send__(:include, ::CliTool::SoftwareDependencies)
@@ -148,64 +177,64 @@ module CliTool
       base.options({
         [:username, :user] => {
           default: %x{whoami}.strip,
-          dependency: :required,
+          argument: :required,
           short: :u,
           documentation: 'SSH username'
         },
         [:password, :pass] => {
-          default: '22',
-          dependency: :required,
+          argument: :required,
           short: :p,
-          documentation: 'SSH password (not implemented)'
+          documentation: 'SSH password (not implemented)',
+          secure: true
         },
         identity: {
-          dependency: :required,
+          argument: :required,
           short: :i,
           documentation: 'SSH key to use'
         },
         host: {
-          dependency: :required,
+          argument: :required,
           short: :h,
-          documentation: 'SSH host to connect to'
+          documentation: 'SSH host to connect to',
+          required: true
         },
         port: {
           default: '22',
-          dependency: :required,
-          short: :p,
+          argument: :required,
           documentation: 'SSH port to connect on'
         },
         [:tags, :tag] => {
-          dependency: :required,
+          argument: :required,
           short: :t,
           documentation: 'Run tags (limit scripts to run)',
           preprocess: ->(tags) { tags.split(',').map{ |x| x.strip.to_sym } }
-        },
-        debug: :none
+        }
       })
     end
 
-    # NEED SINGLETON OBJECT!!!
-
-    class << self
+    module ClassMethods
       def script(options = {}, &block)
-        script = Proc.new do |obj|
+        script = Proc.new do
           run = true
 
-          if obj[:tags]
-            tags = (options[:tags] || []).concat([options[:tag]]).compact.flatten
-            run = false if (kls.tags.map{ |x| "#{x}".strip.to_sym } & tags).empty?
+          # Allow restricting the runs based on the tags provided
+          if self.tags
+            script_tags = (options[:tags] || []).concat([options[:tag]]).compact.flatten
+            run = false if (self.tags & script_tags).empty?
           end
+
+          # Run only when the tag is provided if tag_only option is provided
+          run = false if run && options[:tag_only] == true && self.tags.empty?
 
           if run # Do we want to run this script?
             build_script = Script.new
-            build_script.__send__(:instance_exec, obj, &block)
+            build_script.__send__(:instance_exec, self, &block)
             if options[:reboot] == true
               build_script.exec('shutdown -r now', :sudo)
-              puts "Waiting for server reboot!"
-              sleep 5
+              puts "\nServer will reboot upon completion of this block!\n", [:blue, :italic]
             elsif options[:shutdown] == true
               build_script.exec('shutdown -h now', :sudo)
-              puts "Server shutdown requested!"
+              puts "\nServer will shutdown upon completion of this block!\n", [:blue, :italic]
             end
 
             build_script
@@ -225,7 +254,7 @@ module CliTool
         queue(Script.new.exec('shutdown -r now', :sudo))
       end
 
-      def   !(*a, &b)
+      def run_suite!(*a, &b)
         run(:run_suite!, *a, &b)
       end
 
@@ -239,7 +268,7 @@ module CliTool
       def queue(*items)
         return @@queue || [] if items.empty?
         items.map!{ |x| x.is_a?(Script) ? x.to_s : x }.flatten!
-        ((@@queue ||= []) << x).flatten!
+        ((@@queue ||= []) << items).flatten!
         self
       end
     end
@@ -252,29 +281,55 @@ module CliTool
       ssh_cmd =[ 'ssh -t -t' ]
       ssh_cmd << "-I #{@identity}" if @identity
       ssh_cmd << "-p #{@port}"     if @port
-      ssh_cmd << "#{@user}@#{@host}"
-      ssh_cmd << "<<-SCRIPT\n#{script}\nexit;\nSCRIPT"
+      ssh_cmd << "#{@username}@#{@host}"
+      ssh_cmd << "/bin/bash -s"
 
-      if @debug
-        message = "About to run remote process over ssh on #{@user}@#{@host}:#{@port}"
+      # Show debug script
+      if self.debug
+        pretty_cmd = ssh_cmd.concat(["<<-SCRIPT\n#{script}\nexit;\nSCRIPT"]).join(' ')
+        message = "About to run remote process over ssh on #{@username}@#{@host}:#{@port}"
         puts message, :blue
         puts '#' * message.length, :blue
-        puts script, :green
+        puts pretty_cmd, :green
         puts '#' * message.length, :blue
-        confirm "Should we continue?", :red
+        confirm "Should we continue?", :orange
+      else
+        sleep 2
       end
 
-      return false unless ssh_connection?
+      #ssh_cmd << %{"#{script.gsub(/"/, '\\\1')}"}
+      ssh_cmd << "<<-SCRIPT\n#{script}\nexit;\nSCRIPT"
+      ssh_cmd << %{| grep -v 'stdin: is not a tty'}
 
+      puts "Running Script", [:blue, :italic]
+
+      # Run command if a connection is available
+      return false unless ssh_connection?
+      puts "" # Empty Line
       system(ssh_cmd.join(' '))
-      $?.success?
+      exec_success = $?.success?
+      puts "" # Empty Line
+
+      # Print message with status
+      if exec_success
+        puts "Script finished successfully.", [:green, :italic]
+      else
+        puts "There was an error running remote execution!", [:red, :italic]
+      end
+
+      # Return status
+      exec_success
     end
 
     def run_suite!
-      self.class.queue.each do |item|
-        item = instance_exec(&item) if item.is_a?(Proc)
-        remote_exec!(item) if item.is_a?(String)
+      self.class.__send__(:queue).each do |item|
+        item = instance_exec(self, &item) if item.is_a?(Proc)
+        remote_exec!(item.to_s) if item.is_a?(String) || item.is_a?(Script)
       end
+    end
+
+    def tag?(*tgs)
+      self.tags && ! (self.tags & tgs).empty?
     end
 
     private
@@ -287,7 +342,7 @@ module CliTool
         %x{nc -z #{@host} #{@port}}
         port_available = $?.success?
         break if port_available
-        print 'Waiting for ssh...' if tries < 1
+        print 'Waiting for ssh...', [:blue, :italic] if tries < 1
         print '.'
         tries += 1
         sleep 4
