@@ -213,6 +213,10 @@ module CliTool
     end
 
     module ClassMethods
+      def script_plugin(object)
+        Script.__send__(:include, object)
+      end
+
       def script(options = {}, &block)
         script = Proc.new do
           run = true
@@ -258,6 +262,10 @@ module CliTool
         run(:run_suite!, *a, &b)
       end
 
+      def run!(command, *a, &b)
+        run(command, *a, &b)
+      end
+
       def custom!(*a, &b)
         Proc.new { |obj| obj.instance_exec(*a, &b) }
         false
@@ -279,7 +287,7 @@ module CliTool
 
     def remote_exec!(script)
       ssh_cmd =[ 'ssh -t -t' ]
-      ssh_cmd << "-I #{@identity}" if @identity
+      ssh_cmd << "-i #{@identity}" if @identity
       ssh_cmd << "-p #{@port}"     if @port
       ssh_cmd << "#{@username}@#{@host}"
       ssh_cmd << "/bin/bash -s"

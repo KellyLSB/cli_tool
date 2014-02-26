@@ -8,13 +8,14 @@ module CliTool
     # Use to add the methods below to any class
     def self.included(base)
       base.extend(ClassMethods)
+      base.__send__(:include, ::CliTool::StdinOut)
       base.options({
         debug: {
           argument: :none,
           documentation: [
             "This is used to trigger debug mode in your app. It will be set to #{base}.debug.",
             "In debug mode we do not respect the secure option and your secure fields will be displayed in clear text!",
-            [:black, :white_bg]
+            [:black, :red_bg]
           ]
         },
         help: {
@@ -29,20 +30,16 @@ module CliTool
 
       # Map for symbol types
       GOL_MAP = {
-        none: GetoptLong::NO_ARGUMENT,
+        none:     GetoptLong::NO_ARGUMENT,
         optional: GetoptLong::OPTIONAL_ARGUMENT,
         required: GetoptLong::REQUIRED_ARGUMENT
       }
 
       # Create the options array
       def options(opts = nil)
-        @@options ||= []
-
-        # If no options were passed then return
-        return @@options.uniq unless opts
-
-        _create_preprocess_(opts)
-        @@options = @@options.concat(_create_gola_(opts)).uniq
+        return (__get_options(:gol_options) || []).uniq unless opts
+        __process_options(opts)
+        true
       end
 
       # Ensure the right format of the options (primarily dashes and casing)
@@ -57,21 +54,17 @@ module CliTool
             case retval
             when :set, :setter
               "#{option}="
+            when :dash, :hyphen, :clize
+              "#{option}".gsub(/=$/, '').gsub('_', '-')
             when :primary
               all_opts = __get_options(:all_options)
-
-              if all_opts.has_key?(option)
-                option
-              else
-                all_opts.map { |opt, option_args|
-                  aliases = option_args[:aliases]
-                  if aliases && aliases.include?(option)
-                    opt
-                  else
-                    nil
-                  end
-                }.compact.flatten.first
-              end
+              hyphenated = optionify(option, :hyphen)
+              option = all_opts.has_key?(hyphenated) ? option : Proc.new {
+                all_opts.reduce(nil) do |result, (opt, opt_args)|
+                  [opt].concat(opt_args[:aliases]).include?(hyphenated) ? opt : result
+                end
+              }.call
+              optionify(option)
             else
               option
             end
@@ -121,7 +114,8 @@ module CliTool
 
         # Option setter proc
         option_setter = Proc.new do |option, value|
-          option = optionify(option, :primary)
+          option_attr = optionify(option, :primary)
+          option = optionify(option_attr, :dash)
           processed_options << option
 
           # Help process values
@@ -146,18 +140,19 @@ module CliTool
           end
 
           # Show notice of the setting being set on the instance
-          if class_vars[:private_options].include?(option) && ! instance.debug
-            m = "Setting @#{option} = #{'*' * value.length} :: Value hidden for privacy"
+          if class_vars[:private_options].include?(option) && ! object.debug
+            value_hidden = value.respond_to?(:length) ? ('*' * value.length).inspect : colorize('<hidden>', :italic)
+            m = "Setting @#{option_attr} = #{value_hidden} :: Value hidden for privacy"
             max_puts_length = m.length if m.length > max_puts_length
             puts m, :blue
           else
-            m = "Setting @#{option} = #{value}"
+            m = "Setting @#{option_attr} = #{value.inspect}"
             max_puts_length = m.length if m.length > max_puts_length
             puts m, :green
           end
 
           # Do the actual set for us
-          object.__send__(optionify(option, :set), value)
+          object.__send__(optionify(option_attr, :set), value)
         end
 
         # Actually grab the options from GetoptLong and process them
@@ -296,112 +291,93 @@ module CliTool
 
       private
 
-      def _create_preprocess_(opts)
+      def __process_options(opts)
+        # Standardize the options input to have hash arguments and hypenated options
+        opts = opts.reduce({}) do |standardized_options, (options, option_args)|
+          option_args = option_args.is_a?(Hash) ? option_args : {argument: option_args}
+          option_args[:aliases] = optionify_all((option_args[:aliases] || []).concat([options]), :dash)
+          standardized_options.merge(option_args[:aliases].shift => option_args)
+        end
 
         # Set the preprocessor for options (used primarily for formatting or changing types)
-        __generic_option_reducer(:preprocessors, {}, opts, only_with: :preprocess) do |pre_proc, (options, option_args)|
-          pre_proc.merge(options.shift => option_args[:preprocess])
+        __generic_option_reducer(:preprocessors, {}, opts, only_with: :preprocess) do |pre_proc, (option, option_args)|
+          pre_proc.merge(option => option_args[:preprocess])
         end
 
         # Set the required options and dependencies for the parser
-        __generic_option_reducer(:required_options, {}, opts, only_with: :required) do |req_opts, (options, option_args)|
-          primary_name = options.shift
+        __generic_option_reducer(:required_options, {}, opts, only_with: :required) do |req_opts, (option, option_args)|
 
           # Set the aliases for the required option
-          hash = (option_args[:required].is_a?(Hash) ? option_args[:required] : {}).merge(aliases: options)
+          hash = option_args[:required].is_a?(Hash) ? option_args[:required] : {}
 
           # Ensure that the option names are properly formatted in the alternatives and dependencies
-          hash[:dependencies] = optionify_all(hash[:dependencies])
-          hash[:alternatives] = optionify_all(hash[:alternatives])
+          hash[:dependencies] = optionify_all(hash[:dependencies], :dash)
+          hash[:alternatives] = optionify_all(hash[:alternatives], :dash)
 
           # Merge together the options as required
           if option_args[:required].is_a?(Hash)
-            req_opts.merge(primary_name => hash)
+            req_opts.merge(option => hash)
           else
-            req_opts.merge(primary_name => hash.merge(force: !! option_args[:required]))
-          end
-        end
-
-        # Create a cache of all the options available
-        __generic_option_reducer(:all_options, {}, opts) do |opt_cache, (options, option_args)|
-          primary_name = options.shift
-
-          if option_args.is_a?(Hash)
-            opt_cache.merge(primary_name => option_args.merge(aliases: options))
-          else
-            opt_cache.merge(primary_name => {aliases: options, argument: option_args})
+            req_opts.merge(option => hash.merge(force: !! option_args[:required]))
           end
         end
 
         # Create a list of the "secure options" (hide value from client; as much as possible)
-        __generic_option_reducer(:private_options, [], opts, only_with: :private) do |priv_opts, (options, option_args)|
-          primary_name = options.shift
-
+        __generic_option_reducer(:private_options, [], opts, only_with: :private) do |priv_opts, (option, option_args)|
           if option_args[:private]
-            priv_opts << primary_name
+            priv_opts << option
           else
             priv_opts
           end
         end
 
         # Set the default options to be set when no values are passed
-        __generic_option_reducer(:default_options, {}, opts, only_with: :default) do |default_opts, (options, option_args)|
-          default_opts.merge(options.shift => option_args[:default])
+        __generic_option_reducer(:default_options, {}, opts, only_with: :default) do |default_opts, (option, option_args)|
+          default_opts.merge(option => option_args[:default])
         end
 
-        # Create the attribute accessors
-        opts.keys.each do |options|
-          options = optionify_all(options)
-          primary_name = options.shift
-          attr_accessor(primary_name)
-        end
-      end
+        # Create a cache of all the options available
+        __generic_option_reducer(:all_options, {}, opts)
 
-      def _create_gola_(opts)
-        gola = []
+        # Create the Getoptlong syntax
+        __generic_option_reducer(:gol_options, [], opts) do |gol_options, (option, option_args)|
+          argument_dependency = GOL_MAP[option_args[:argument]]
+          aliases = option_args[:aliases] || []
 
-        # Loop through the options to create
-        # the GetoptLong configuration array
-        opts.each do |opt, details|
+          # Create the attribute accessor
+          attr_accessor(optionify(option))
 
-          short = nil
-          dependency = :none
+          # Create the primary GOL option
+          gol_option =[ "--#{option}" ]
+          gol_option << "-#{option_args[:short]}" if option_args[:short]
+          gol_option << argument_dependency
 
-          # If we have extended details determine them
-          if details.is_a?(Hash)
-            short = details[:short]
-            dependency = details[:argument]
-          else
-            dependency = details
-          end
+          # Get the primary setter
+          primary_setter = optionify(option, :set)
 
-          # Prepare the GetoptLong Array option
-          golao  = []
-          golao << "-#{short}" if short
-          golao << GOL_MAP[dependency.to_sym]
+          # Handle the aliases
+          gol_option_set = aliases.reduce([gol_option]) do |gol_list, ali|
+            alias_setter = optionify(ali, :set)
 
-          # If the option has aliases then create
-          # additional GetoptLong Array options
-          if opt.is_a?(Array)
-            opt.each_with_index do |key, i|
-              golaot = golao.dup
-              golaot.shift if i > 0 # Remove Short Code
-              golaot.unshift("--#{key}")
-              gola << golaot
+            # Create the attribute accessor alias
+            define_method(alias_setter) do |value|
+              __send__(primary_setter, value)
             end
-          else
-            golao.unshift("--#{opt}")
-            gola << golao
-          end
-        end
 
-        gola
+            # Create the GOL option aliases
+            gol_alias =[ "--#{ali}" ]
+            gol_alias << argument_dependency
+            gol_list << gol_alias
+          end
+
+          # Append to the option master list
+          gol_options.concat(gol_option_set)
+        end
       end
 
       private
 
       def __generic_option_reducer(instance_var, default = [], opts = {}, args = {}, &block)
-        opts = opts.reduce({}) { |o, (k, v)| o.merge(optionify_all(k) => v) }
 
         # Require certain keys be in the option cache. This is done to save time of the processing and make it easier to write
         # the code to parse the options and set the requirements and dependencies of each option.
@@ -411,7 +387,10 @@ module CliTool
 
         # Run the reducer and set the class variables accordingly
         class_variable_set("@@__#{instance_var}", default) unless class_variable_defined?("@@__#{instance_var}")
-        class_variable_set("@@__#{instance_var}", opts.reduce(class_variable_get("@@__#{instance_var}") || default, &block))
+        cached_value = class_variable_get("@@__#{instance_var}") || default
+
+        # Set the value with either the reduce value or the passed value if no block was given
+        class_variable_set("@@__#{instance_var}", block_given? ? opts.reduce(cached_value, &block) : cached_value.merge(opts))
       end
 
       def __get_options(instance_var = nil)

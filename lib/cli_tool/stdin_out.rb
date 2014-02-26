@@ -142,7 +142,11 @@ module CliTool
           ANSI_COLORS[c] ? o << "\e[#{ANSI_COLORS[c]}m" : o
         end
 
-        "#{prefix}#{text}\e[0m" # Add color
+        suffix = "\e[0m"
+
+        # Allow color nesting
+        text = text.gsub(suffix, "#{suffix}#{prefix}")
+        "#{prefix}#{text}#{suffix}" # Add color
       end
     end
   end
