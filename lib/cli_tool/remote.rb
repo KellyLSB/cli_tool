@@ -185,7 +185,7 @@ module CliTool
           argument: :required,
           short: :p,
           documentation: 'SSH password (not implemented)',
-          secure: true
+          private: true
         },
         identity: {
           argument: :required,
@@ -196,7 +196,7 @@ module CliTool
           argument: :required,
           short: :h,
           documentation: 'SSH host to connect to',
-          required: true
+          require: true
         },
         port: {
           default: '22',
