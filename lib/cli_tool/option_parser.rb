@@ -77,16 +77,20 @@ module CliTool
         [option].compact.flatten.map { |x| optionify(x, retval) }
       end
 
-      def trap!
-        Signal.trap("INT") do |signo|
-          if Signal.respond_to?(:signame)
-            signal = Signal.signame(signo)
-            puts "Received: #{signal}..."
-            puts "Exiting..."
-          else
-            puts "#{signo} Exiting..."
+      def trap!(signal = "INT", &block)
+        Signal.trap(signal) do |signo|
+          return block.call(singal) if block.is_a?(Proc)
+
+          case signal
+          when 'SIGQUIT'
+            puts %{Received Signal "#{signal}"... Exiting...}
+            exit 0
+          when 'SIGKILL'
+            puts %{Received Signal "#{signal}"... Killing...}
+            exit 1
           end
-          exit 1
+
+          puts %{Received Signal "#{signal}"... Don't know what to do...}
         end
       end
 
@@ -179,10 +183,10 @@ module CliTool
             exit_code   = 1
           end
 
-          # Get the missing options that were expected
-          missing_options = class_vars[:required_options].keys - processed_options
+          # Get a array of all the options that are required and were not provided
+          missing_options = class_vars[:required_options].select{ |opt, arg| arg[:require] == true }.keys - processed_options
 
-          # Handle missing options and their potential alternatives
+          # If a option was marked as missing; verify if an alternative was provided
           __slice_hash(class_vars[:required_options], *missing_options).each do |option, option_args|
             if (option_args[:alternatives] & processed_options).empty?
               object.help = true
@@ -192,27 +196,26 @@ module CliTool
             end
           end
 
-          # Ensure that the dependencies for options are met (if applicable)
-          __slice_hash(class_vars[:required_options], *processed_options).each do |option, option_args|
-            missing_dependencies = option_args[:dependencies] - processed_options
-            missing_dependencies.each do |dep_opt|
-              puts "The option `--#{option}' expected a value for `--#{dep_opt}', but not was received", :red
-              missing_options << dep_opt
-
-              object.help = true
-              exit_code   = 1
-            end
-
-            puts '' unless missing_dependencies.empty?
+          # Find any missing dependencies that may have been required by an option
+          missing_dependencies = __slice_hash(class_vars[:required_options], *processed_options).reduce({}) do |out, (option, option_args)|
+            missing = option_args[:dependencies] - processed_options
+            missing.reduce(out) { |o, missed| ((o[missed] ||= []) << option); o }
           end
 
-          # Raise an error when required options were not provided.
-          # Change the exit code and enable help output (which will exit 1; on missing opts)
-          unless missing_options.empty?
-            missing_options.uniq.each do |option|
-              puts "The required option `--#{option}' was not provided.", :red
-            end
+          # Let the user know that a dependency has not been met.
+          missing_dependencies.each do |dependency, options|
+            options = (options.length > 1 ? options.reduce('') { |s, o| s << "\n\t--#{o}" } : "--#{options.first}") << "\n"
+            puts "The option --#{dependency} is required by the following options: #{options}", :red
+            missing_options << dependency
+            object.help = true
+            exit_code   = 1
+          end
 
+          # Tell user that required options were not provided
+          unless missing_options.empty?
+            options = missing_options.uniq
+            options = (options.length > 1 ? options.reduce('') { |s, o| s << "\n\t--#{o}" } : "--#{options.first}") << "\n"
+            puts "The following required options were not provided: #{options}", :red
             object.help = true
             exit_code   = 1
           end
@@ -251,7 +254,7 @@ module CliTool
             end
 
             # Set up the options list
-            message = "\t" + (option_args[:aliases] << option).map{ |x| "--#{x}#{long_dep}"}.join(', ')
+            message = "\t" + option_args[:aliases].map{ |x| "--#{x}#{long_dep}"}.join(', ')
             message << ", -#{option_args[:short]}#{short_dep}" if option_args[:short]
             message << %{ :: Default: "#{option_args[:default]}"} if option_args[:default]
 
@@ -296,7 +299,7 @@ module CliTool
         opts = opts.reduce({}) do |standardized_options, (options, option_args)|
           option_args = option_args.is_a?(Hash) ? option_args : {argument: option_args}
           option_args[:aliases] = optionify_all((option_args[:aliases] || []).concat([options]), :dash)
-          standardized_options.merge(option_args[:aliases].shift => option_args)
+          standardized_options.merge(option_args[:aliases].first => option_args)
         end
 
         # Set the preprocessor for options (used primarily for formatting or changing types)
@@ -305,21 +308,15 @@ module CliTool
         end
 
         # Set the required options and dependencies for the parser
-        __generic_option_reducer(:required_options, {}, opts, only_with: :required) do |req_opts, (option, option_args)|
-
-          # Set the aliases for the required option
-          hash = option_args[:required].is_a?(Hash) ? option_args[:required] : {}
+        __generic_option_reducer(:required_options, {}, opts, includes: [:require, :dependencies, :alternatives]) do |req_opts, (option, option_args)|
+          hash = __slice_hash(option_args, :require, :dependencies, :alternatives)
 
           # Ensure that the option names are properly formatted in the alternatives and dependencies
           hash[:dependencies] = optionify_all(hash[:dependencies], :dash)
           hash[:alternatives] = optionify_all(hash[:alternatives], :dash)
 
-          # Merge together the options as required
-          if option_args[:required].is_a?(Hash)
-            req_opts.merge(option => hash)
-          else
-            req_opts.merge(option => hash.merge(force: !! option_args[:required]))
-          end
+          # Apply the required options
+          req_opts.merge(option => hash)
         end
 
         # Create a list of the "secure options" (hide value from client; as much as possible)
@@ -342,7 +339,7 @@ module CliTool
         # Create the Getoptlong syntax
         __generic_option_reducer(:gol_options, [], opts) do |gol_options, (option, option_args)|
           argument_dependency = GOL_MAP[option_args[:argument]]
-          aliases = option_args[:aliases] || []
+          aliases = option_args[:aliases][1..-1] || []
 
           # Create the attribute accessor
           attr_accessor(optionify(option))
@@ -381,8 +378,13 @@ module CliTool
 
         # Require certain keys be in the option cache. This is done to save time of the processing and make it easier to write
         # the code to parse the options and set the requirements and dependencies of each option.
-        if args[:only_with]
+        if args[:only_with] && args[:includes].nil?
           opts = opts.select { |k, v| v.is_a?(Hash) && [args[:only_with]].flatten.reduce(true) { |o, key| o && v.has_key?(key) } }
+        end
+
+        # Just like only_with except use an or condition instead
+        if args[:includes] && args[:only_with].nil?
+          opts = opts.select { |k, v| v.is_a?(Hash) && [args[:includes]].flatten.reduce(false) { |o, key| o || v.has_key?(key) } }
         end
 
         # Run the reducer and set the class variables accordingly
