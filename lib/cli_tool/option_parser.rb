@@ -1,6 +1,6 @@
 require 'getoptlong'
-require 'pry'
 require 'awesome_print'
+require 'pry'
 
 module CliTool
   module OptionParser

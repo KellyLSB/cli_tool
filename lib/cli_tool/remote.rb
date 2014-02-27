@@ -1,4 +1,5 @@
 require 'singleton'
+require 'awesome_print'
 require 'pry'
 
 module CliTool
@@ -118,6 +119,13 @@ module CliTool
           script = File.read(script)
         end
 
+        # Remove unnecessary indentation
+        if script.include?("\n")
+          script  = script.split("\n").reject { |x| x.strip.empty? }
+          indents = script.first.match(/^([\t ]*)(.*)$/)[1]
+          script  = script.map { |x| x.gsub(/#{indents}/, '') }.join("\n")
+        end
+
         # Wrap the script in a sudoers block
         if sudo || sudo == :sudo
           sudo_script  = %{sudo su -c "/bin/bash" #{sudouser || :root}}
@@ -125,7 +133,7 @@ module CliTool
           script = sudo_script
         end
 
-        @commands << script.rstrip
+        @commands << script.rstrip.gsub('$', '\$')
         self
       end
 
