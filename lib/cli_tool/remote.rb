@@ -13,12 +13,13 @@ module CliTool
       attr_accessor :environment
       attr_accessor :indent
 
-      def initialize
-        @environment = {}
+      def initialize(indent = 2, opts = {})
+        @environment = opts[:environment] || {}
         @commands    = []
         @apt         = {}
         @remote_installed = 0
-        @indent      = 0
+        @indent      = indent
+        @sudo        = opts[:sudo] || false
       end
       alias reset initialize
 
@@ -106,15 +107,31 @@ module CliTool
         if?((exist ? '' : '! ') + %{-f "#{file}"}, &block)
       end
 
-      def directory_exist(directory, exist = true, &block)
-        if?((exist ? '' : '! ') + %{-d "#{file}"}, &block)
+      def directory_exist?(directory, exist = true, &block)
+        if?((exist ? '' : '! ') + %{-d "#{directory}"}, &block)
+      end
+
+      def for_in(value, source, &block)
+        for_script = "for #{value} in #{source}\n#{"\t" * (@indent + 2)}do\n\n"
+        for_script << Script.new(@indent + 2, environment: @environment).__send__(:instance_exec, &block).to_s(env: false)
+        for_script << "\n#{"\t" * @indent}done"
+        @commands << for_script << ''
+        self
+      end
+
+      def if?(condition, &block)
+        if_script = "if [ #{condition} ]\n#{"\t" * (@indent + 2)}then\n\n"
+        if_script << Script.new(@indent + 2, environment: @environment).__send__(:instance_exec, &block).to_s(env: false)
+        if_script << "\n#{"\t" * @indent}fi"
+        @commands << if_script << ''
+        self
       end
 
       ##########
       #= Exec =#
       ##########
 
-      def exec(script, sudo = false, sudouser = :root)
+      def exec(script, use_sudo = false, sudo_user = :root)
         if File.exist?(script)
           script = File.read(script)
         end
@@ -126,19 +143,44 @@ module CliTool
           script  = script.map { |x| x.gsub(/#{indents}/, '') }.join("\n")
         end
 
-        # Wrap the script in a sudoers block
-        if sudo || sudo == :sudo
-          sudo_script  = %{sudo su -c "/bin/bash" #{sudouser || :root}}
-          sudo_script << %{ <<-EOF\n#{get_environment_exports}#{script.rstrip}\nEOF}
-          script = sudo_script
+        # Use sudo if requested
+        if use_sudo && ! @sudo
+          return sudo(sudo_user) do
+            exec(script)
+          end
         end
 
-        @commands << script.rstrip.gsub('$', '\$')
+        @commands << script.rstrip
         self
       end
 
-      def to_s(indent = 0)
-        @commands.reduce([get_environment_exports(@indent)]){ |out, x|  out << ((' ' * @indent) + x) }.join("\n")
+      def sudo(user = :root, &block)
+        sudo_script = %{sudo su -c "/bin/bash -i -s --" #{user} <<-SCRIPT\n}
+        sudo_script << Script.new(@indent + 2, sudo: true, environment: @environment).__send__(:instance_exec, &block).to_s(heredoc: true)
+        sudo_script << "\n#{"\t" * @indent}SCRIPT"
+        @commands << sudo_script << ''
+        self
+      end
+
+      def to_s(opts = {})
+        env = opts[:env] == false ? [] : (get_environment_exports << '')
+        result = env.concat(@commands).map! do |line|
+          ("\t" * @indent) + line
+        end
+
+        # Join the commands
+        result = result.join("\n")
+
+        if @indent < 3
+          result = result.gsub('$', '\$')
+          result << "\n"
+        end
+
+        if opts[:heredoc] == true
+          result = result.gsub('$', '\\\\\$')
+        end
+
+        result
       end
 
       private
@@ -163,15 +205,10 @@ module CliTool
         self
       end
 
-      def if?(condition, &block)
-        exec(%{if [ #{condition} ]; then\n"} << Script.new.__send__(:instance_exec, &block).to_s(@indent + 2) << "\nfi")
-        self
-      end
-
-      def get_environment_exports(indent = 0)
-        @environment.reduce([]) { |out, (key, val)|
-          out << %{export #{(' ' * indent)}#{key.upcase}=#{val}}
-        }.join("\n") << "\n"
+      def get_environment_exports
+        @environment.reduce([]) do |out, (key, val)|
+          out << "export #{key.upcase}=#{val}"
+        end
       end
     end
 
@@ -294,15 +331,16 @@ module CliTool
     end
 
     def remote_exec!(script)
-      ssh_cmd =[ 'ssh -t -t' ]
+      ssh_cmd =[ 'ssh' ]
       ssh_cmd << "-i #{@identity}" if @identity
       ssh_cmd << "-p #{@port}"     if @port
       ssh_cmd << "#{@username}@#{@host}"
-      ssh_cmd << "/bin/bash -s"
+      ssh_cmd << "/bin/bash -i -s --"
+      ssh_cmd << "<<-EOF\n#{script}\nexit;\nEOF"
 
       # Show debug script
       if self.debug
-        pretty_cmd = ssh_cmd.concat(["<<-SCRIPT\n#{script}\nexit;\nSCRIPT"]).join(' ')
+        pretty_cmd = ssh_cmd.join(' ')
         message = "About to run remote process over ssh on #{@username}@#{@host}:#{@port}"
         puts message, :blue
         puts '#' * message.length, :blue
@@ -312,10 +350,6 @@ module CliTool
       else
         sleep 2
       end
-
-      #ssh_cmd << %{"#{script.gsub(/"/, '\\\1')}"}
-      ssh_cmd << "<<-SCRIPT\n#{script}\nexit;\nSCRIPT"
-      ssh_cmd << %{| grep -v 'stdin: is not a tty'}
 
       puts "Running Script", [:blue, :italic]
 
