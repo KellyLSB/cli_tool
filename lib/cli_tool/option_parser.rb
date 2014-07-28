@@ -42,6 +42,10 @@ module CliTool
         true
       end
 
+      def option(option, args = :optional)
+        options(option => args)
+      end
+
       # Ensure the right format of the options (primarily dashes and casing)
       def optionify(option, retval = false)
         if option.is_a?(Array)
